@@ -9,7 +9,10 @@
 //! - **Matching.** [`check_candidate`] compares a candidate with the clip: file name, extension,
 //!   fingerprint ("Clip ID"), duration, media start (timecode) and stream metadata.
 //! - **Relink others automatically.** Linking one file derives a folder remap (the old path's
-//!   prefix → the new one) and applies it to every other missing file, checking each one.
+//!   prefix → the new one) and applies it to every other missing file, checking each one. It also
+//!   tries the same file name next to the new file, then walks a folder tree by exact file name
+//!   ([`index_folder`]): the optional `folder` on `media.relink` (Link Media's Search-in path), or
+//!   the new file's parent when that is unset.
 //! - **Search.** [`search`] walks a folder for files named like the missing ones.
 
 use std::collections::BTreeMap;
@@ -369,14 +372,15 @@ fn apply(s: &mut Session, plans: Vec<Plan>, align_timecode: bool, label: &str) -
     Ok(rows)
 }
 
-/// Other missing items that the remap (or the new file's folder) finds, checked.
-fn others(s: &Session, skip: ItemId, old: &str, new: &str, o: &MatchOptions) -> Vec<Plan> {
+/// Other missing items that the remap, the new file's folder, or a folder-tree name search finds.
+fn others(s: &Session, skip: ItemId, old: &str, new: &str, o: &MatchOptions, search_folder: Option<&str>) -> Vec<Plan> {
     let remap = derive_remap(old, new);
     let new_dir = Path::new(new).parent().map(Path::to_path_buf);
     let mut out = Vec::new();
+    let mut planned = std::collections::BTreeSet::from([skip]);
     for m in scan(&s.project, &s.media, &*s.services) {
         let id = ItemId(m.item);
-        if id == skip || m.status != "missing" {
+        if planned.contains(&id) || m.status != "missing" {
             continue;
         }
         let mut tries = Vec::new();
@@ -395,9 +399,35 @@ fn others(s: &Session, skip: ItemId, old: &str, new: &str, o: &MatchOptions) -> 
             if let Ok(c) = check_candidate(s, id, &p, o)
                 && c.ok
             {
+                planned.insert(id);
                 out.push(Plan { item: id, cand: c });
                 break;
             }
+        }
+    }
+    // Exact file-name search under the Search-in folder when set, else under the new file's parent
+    // tree; the same index `media.autoRelink {folder}` uses, so one Locate finds nested siblings.
+    let root = search_folder.filter(|f| !f.trim().is_empty()).map(PathBuf::from).or(new_dir);
+    let Some(root) = root else { return out };
+    let index = index_folder(&root, 20_000);
+    for m in scan(&s.project, &s.media, &*s.services) {
+        let id = ItemId(m.item);
+        if planned.contains(&id) || m.status != "missing" {
+            continue;
+        }
+        let key = m.file_name.to_ascii_lowercase();
+        let mut best: Option<Candidate> = None;
+        for cand in index.get(&key).into_iter().flatten() {
+            if let Ok(c) = check_candidate(s, id, &cand.to_string_lossy(), o)
+                && c.ok
+                && best.as_ref().is_none_or(|b| c.score > b.score)
+            {
+                best = Some(c);
+            }
+        }
+        if let Some(c) = best {
+            planned.insert(id);
+            out.push(Plan { item: id, cand: c });
         }
     }
     out
@@ -428,7 +458,8 @@ pub fn relink(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut plans = vec![Plan { item, cand: c }];
     if o.relink_others {
-        plans.extend(others(s, item, &old, &path, &o));
+        let folder = str_p(p, "folder").filter(|f| !f.trim().is_empty());
+        plans.extend(others(s, item, &old, &path, &o, folder));
     }
     let rows = apply(s, plans, o.align_timecode, "Link Media")?;
     Ok(json!({"relinked": rows, "remaining": s.offline.missing.iter().map(|i| i.0).collect::<Vec<_>>()}))
@@ -686,7 +717,7 @@ pub fn commands() -> Vec<CommandSpec> {
             label: "Relink Media",
             menu: &[],
             shortcut: None,
-            params: r#"{"item":id,"path":str,"force":bool=false,"relinkOthers":bool=true,"alignTimecode":bool=false,"match":{"fileName":bool,"extension":bool,"clipId":bool,"duration":bool,"mediaStart":bool,"metadata":bool}?}"#,
+            params: r#"{"item":id,"path":str,"force":bool=false,"relinkOthers":bool=true,"alignTimecode":bool=false,"folder":str?,"match":{"fileName":bool,"extension":bool,"clipId":bool,"duration":bool,"mediaStart":bool,"metadata":bool}?}"#,
             enabled: always,
             run: relink,
             journal: true,
