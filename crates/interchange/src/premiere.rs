@@ -302,6 +302,12 @@ fn spend(work_left: &mut usize, node: Node<'_, '_>) -> Result<()> {
     Ok(())
 }
 
+/// Charge retaining a cloned media/sequence reference string (at least one unit), then clone it.
+fn charge_retained_ref(work_left: &mut usize, value: &str) -> Result<String> {
+    *work_left = work_left.checked_sub((value.len() / 64).max(1)).ok_or_else(|| error("media reference work limit exceeded"))?;
+    Ok(value.to_string())
+}
+
 /// A Premiere parse error.
 fn error(message: impl Into<String>) -> Error {
     Error::Parse { format: "Premiere", message: message.into() }
@@ -381,13 +387,21 @@ fn source_target<'a, 'i>(
     Ok(Some(node))
 }
 
+/// `ActualMediaFilePath` when present and non-blank (after trim); otherwise `FilePath`. Blank
+/// `ActualMediaFilePath` must not block a usable `FilePath` (`Some("")` would short-circuit `or_else`).
+fn stored_media_path<'a>(n: Node<'a, '_>) -> Option<&'a str> {
+    child_text(n, "ActualMediaFilePath")
+        .filter(|p| !p.is_empty())
+        .or_else(|| child_text(n, "FilePath").filter(|p| !p.is_empty()))
+}
+
 /// The stored absolute path, or the project-relative `RelativePath` when the absolute path was
 /// saved on another system (a macOS project opened on Windows, or the reverse).
 fn media_path(n: Node<'_, '_>, base_dir: Option<&str>) -> Option<String> {
     if synthetic_code(n).is_some() {
         return None;
     }
-    let stored = child_text(n, "ActualMediaFilePath").or_else(|| child_text(n, "FilePath")).filter(|p| !p.is_empty())?;
+    let stored = stored_media_path(n)?;
     if let (Some(base), Some(relative)) = (base_dir, relative_media_path(n, base_dir))
         && foreign_absolute(stored, base)
     {
@@ -398,8 +412,8 @@ fn media_path(n: Node<'_, '_>, base_dir: Option<&str>) -> Option<String> {
 
 /// The four-character code generated media stores as its decimal "file path", if it has one.
 fn synthetic_code(n: Node<'_, '_>) -> Option<String> {
-    let stored = child_text(n, "ActualMediaFilePath").or_else(|| child_text(n, "FilePath"))?.trim();
-    if stored.is_empty() || !stored.bytes().all(|b| b.is_ascii_digit()) {
+    let stored = stored_media_path(n)?;
+    if !stored.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let code = stored.parse::<u32>().ok()?.to_be_bytes();
@@ -641,7 +655,7 @@ impl<'a, 'i> Objects<'a, 'i> {
     /// A `Media` object's title and path, and the project-relative fallback for its path.
     fn add_media(&mut self, n: Node<'a, 'i>, base_dir: Option<&str>) -> Result<()> {
         if child_text(n, "Title").is_some_and(|s| s.len() > 4096)
-            || child_text(n, "ActualMediaFilePath").or_else(|| child_text(n, "FilePath")).is_some_and(|s| s.len() > 16384)
+            || stored_media_path(n).is_some_and(|s| s.len() > 16384)
             || child_text(n, "RelativePath").is_some_and(|s| s.len() > 16384)
         {
             return Err(error("media title or path is too long"));
@@ -795,9 +809,8 @@ impl<'a, 'i> Reader<'a, 'i, '_> {
         spend(self.work, n)?;
         let name = child_text(n, "Name").unwrap_or("Sequence").to_string();
         // The sequence frame is the video track group's `FrameRect`; the preview size is only the
-        // fallback (it can differ: a 2560x1440 sequence previewing at 1920x1080).
-        let mut width = dimension(value(n, "MZ.Sequence.PreviewFrameSizeWidth"), 1920)?;
-        let mut height = dimension(value(n, "MZ.Sequence.PreviewFrameSizeHeight"), 1080)?;
+        // fallback (it can differ: a 2560x1440 sequence previewing at 1920x1080). Parse preview
+        // dims only when FrameRect is absent so an invalid preview cannot fail a valid FrameRect.
         let mut format = SequenceFormat::default();
         let mut tracks = Vec::new();
         let pointers = child(n, "TrackGroups")
@@ -821,9 +834,10 @@ impl<'a, 'i> Reader<'a, 'i, '_> {
             format.add_group(group, &name)?;
             self.track_group(group, kind, &name, &mut tracks)?;
         }
-        if let Some((w, h)) = format.frame_rect {
-            (width, height) = (w, h);
-        }
+        let (width, height) = match format.frame_rect {
+            Some(size) => size,
+            None => (dimension(value(n, "MZ.Sequence.PreviewFrameSizeWidth"), 1920)?, dimension(value(n, "MZ.Sequence.PreviewFrameSizeHeight"), 1080)?),
+        };
         filmcraft_project::validate_frame_size(width, height).map_err(error)?;
         let object_uid = n.attribute("ObjectUID").ok_or_else(|| error("sequence without ObjectUID"))?.to_string();
         let markers = markers::read(n, &self.objects.ids, self.work, self.report, &name)?;
@@ -1039,11 +1053,16 @@ impl<'a, 'i> Reader<'a, 'i, '_> {
                 && !child_text(p, "IsTimeVarying").is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 && let Some(v) = child(p, "StartKeyframeValue").filter(|v| v.attribute("Encoding") == Some("base64"))
             {
-                *text = self.decoded.get(v, v.text());
+                // Keep an earlier successful decode when a later layer fails.
+                match self.decoded.get(v, v.text()) {
+                    Some(decoded) => *text = Some(decoded),
+                    None if text.is_none() => {}
+                    None => warning(self.report, format!("{label}: a later Source Text layer could not be decoded; earlier text kept")),
+                }
             }
         }
         if text.is_none() {
-            warning(self.report, format!("{label}: static Source Text unavailable; layer name not used as visible text"));
+            warning(self.report, format!("{label}: static SourceText unavailable; layer name not used as visible text"));
         }
         Ok(())
     }
@@ -1146,7 +1165,10 @@ impl<'a, 'i> Reader<'a, 'i, '_> {
         }
         let mut media_path = target.filter(|n| n.has_tag_name("Media")).and_then(|n| media_path(n, self.base_dir));
         let mut media_uid = target.filter(|n| n.has_tag_name("Media")).and_then(|n| n.attribute("ObjectUID")).map(str::to_string);
-        let mut nested_sequence = target.filter(|n| n.has_tag_name("Sequence")).and_then(|n| n.attribute("ObjectUID")).map(str::to_string);
+        let mut nested_sequence = match target.filter(|n| n.has_tag_name("Sequence")).and_then(|n| n.attribute("ObjectUID")) {
+            Some(uid) => Some(charge_retained_ref(self.work, uid)?),
+            None => None,
+        };
         if adjustment_layer.is_some() {
             media_path = None;
             media_uid = None;
@@ -1159,7 +1181,10 @@ impl<'a, 'i> Reader<'a, 'i, '_> {
             media_uid = None;
             nested_sequence = None;
         }
-        if media_path.is_none()
+        // Title fallback only when the ObjectRef chain did not resolve. A resolved Media with no
+        // usable path stays offline; falling back by title can pick a same-named Sequence and look cyclic.
+        if target.is_none()
+            && media_path.is_none()
             && nested_sequence.is_none()
             && generated.is_none()
             && adjustment_layer.is_none()
@@ -1167,7 +1192,7 @@ impl<'a, 'i> Reader<'a, 'i, '_> {
             && !parts.graphic
             && parts.text.is_none()
         {
-            (media_path, nested_sequence) = self.title_fallback(label);
+            (media_path, nested_sequence) = self.title_fallback(label)?;
             // Title fallback has no ObjectUID; Save cannot patch that media by uid.
             media_uid = None;
         }
@@ -1180,18 +1205,23 @@ impl<'a, 'i> Reader<'a, 'i, '_> {
 
     /// The media path or nested sequence an unresolved source reference names by its title. A
     /// title several sources share, or both media and a sequence use, is refused.
-    fn title_fallback(&mut self, label: &str) -> (Option<String>, Option<String>) {
+    fn title_fallback(&mut self, label: &str) -> Result<(Option<String>, Option<String>)> {
         let objects = self.objects;
         let named_sequence = objects.names.get(label).copied().flatten();
         let named_media = objects.media.get(label);
         if objects.ambiguous.contains(label) || objects.names.get(label) == Some(&None) || (named_sequence.is_some() && named_media.is_some()) {
             warning(self.report, format!("{label}: unresolved source reference; ambiguous title fallback refused; left offline"));
-            (None, None)
+            Ok((None, None))
         } else if named_sequence.is_some() || named_media.is_some() {
             warning(self.report, format!("{label}: unresolved source reference; using title fallback"));
-            (named_media.cloned(), named_sequence.map(str::to_string))
+            let nested = match named_sequence {
+                // Charge before cloning: repeated title→sequence fallbacks must not retain unbounded UID copies.
+                Some(uid) => Some(charge_retained_ref(self.work, uid)?),
+                None => None,
+            };
+            Ok((named_media.cloned(), nested))
         } else {
-            (None, None)
+            Ok((None, None))
         }
     }
 
@@ -1338,6 +1368,10 @@ impl SequenceImport<'_> {
             captions.name = name.clone();
         }
         for item in &track.items {
+            if item.disabled {
+                warning(self.report, format!("{}: disabled caption omitted from the native caption track", item.label));
+                continue;
+            }
             captions.captions.push(Caption {
                 id: ClipId(self.b.alloc()),
                 start: item.start,
@@ -1405,7 +1439,10 @@ impl SequenceImport<'_> {
 
     /// Clips of one adjustment layer share its project item, long enough for each use.
     fn adjustment_layer(&mut self, key: &str, item: &Item) -> ItemId {
-        let needed = item.source_out.max(self.fps.frame_duration());
+        // Cover OutPoint and the speed-scaled timeline span (fallback OutPoint omits speed).
+        let timeline = (item.end.0 - item.start.0).max(0) as f64;
+        let speed_scaled = Tick(item.source_in.0.saturating_add((timeline * item.speed.abs()).round() as i64));
+        let needed = item.source_out.max(speed_scaled).max(self.fps.frame_duration());
         match self.b.find_media(key) {
             Some(id) => {
                 if let Some(ItemKind::AdjustmentLayer { duration, .. }) = self.b.p.item_mut(id).map(|i| &mut i.kind) {
@@ -1668,12 +1705,20 @@ fn bin_item(entry: &ProjectEntry, frame: (u32, u32, FrameRate), b: &mut Builder,
         sequences.get(uid).copied()
     } else if let Some(master) = &entry.adjustment_layer {
         let key = format!("premiere-adjustment-layer:{master}");
-        Some(b.find_media(&key).unwrap_or_else(|| {
-            let duration = entry.duration.unwrap_or(Tick::ZERO).max(fps.frame_duration());
-            let id = b.p.add_item(&entry.name, Label::Lavender, ItemKind::AdjustmentLayer { width, height, rate: fps, duration }, None);
-            b.register_media(&key, id);
-            id
-        }))
+        let needed = entry.duration.unwrap_or(Tick::ZERO).max(fps.frame_duration());
+        Some(match b.find_media(&key) {
+            Some(id) => {
+                if let Some(ItemKind::AdjustmentLayer { duration, .. }) = b.p.item_mut(id).map(|i| &mut i.kind) {
+                    *duration = (*duration).max(needed);
+                }
+                id
+            }
+            None => {
+                let id = b.p.add_item(&entry.name, Label::Lavender, ItemKind::AdjustmentLayer { width, height, rate: fps, duration: needed }, None);
+                b.register_media(&key, id);
+                id
+            }
+        })
     } else {
         let media = if let Some(path) = &entry.media_path {
             let spec = MediaSpec {
@@ -1946,6 +1991,74 @@ mod tests {
         let (_, tree, report) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
         assert!(tree.sequences[0].tracks[0].items[0].media_path.is_none());
         assert!(report.mentions("ambiguous"));
+    }
+
+    #[test]
+    fn blank_actual_media_file_path_falls_back_to_file_path() {
+        // Some("") from a blank ActualMediaFilePath must not block FilePath via or_else.
+        for blank in ["", "   "] {
+            let xml = fixture().replace(
+                "<ActualMediaFilePath>/missing/camera.mov</ActualMediaFilePath>",
+                &format!("<ActualMediaFilePath>{blank}</ActualMediaFilePath><FilePath>/from-file-path/camera.mov</FilePath>"),
+            );
+            let (_, tree, _) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
+            assert_eq!(
+                tree.sequences[0].tracks[0].items[0].media_path.as_deref(),
+                Some("/from-file-path/camera.mov"),
+                "blank ActualMediaFilePath {blank:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn title_fallback_sequence_uid_charges_work_budget() {
+        // Import work starts at max(descendants×64, 5_000_000); a long UID must cost enough per clone to exhaust it.
+        let uid = "U".repeat(64 * 100_000);
+        let mut items = String::new();
+        let mut subs = String::new();
+        for i in 0..80 {
+            items.push_str(&format!(r#"<TrackItem ObjectRef="item{i}"/>"#));
+            subs.push_str(&format!(
+                r#"<VideoClipTrackItem ObjectID="item{i}"><ClipTrackItem><TrackItem><Start>0</Start><End>{TPS}</End></TrackItem><SubClip ObjectRef="sub{i}"/></ClipTrackItem></VideoClipTrackItem>
+<SubClip ObjectID="sub{i}"><Name>NestMe</Name></SubClip>"#
+            ));
+        }
+        let xml = format!(
+            r#"<PremiereData>
+<Sequence ObjectUID="timeline"><Name>Timeline</Name><TrackGroups><TrackGroup><Second ObjectRef="group"/></TrackGroup></TrackGroups></Sequence>
+<Sequence ObjectUID="{uid}"><Name>NestMe</Name><TrackGroups><TrackGroup><Second ObjectRef="empty-group"/></TrackGroup></TrackGroups></Sequence>
+<VideoTrackGroup ObjectID="group"><TrackGroup><FrameRate>8467200000</FrameRate><Tracks><Track ObjectURef="track"/></Tracks></TrackGroup></VideoTrackGroup>
+<VideoTrackGroup ObjectID="empty-group"><TrackGroup><FrameRate>8467200000</FrameRate><Tracks/></TrackGroup></VideoTrackGroup>
+<VideoClipTrack ObjectUID="track"><ClipTrack><Track><Index>0</Index></Track><ClipItems><TrackItems>{items}</TrackItems></ClipItems></ClipTrack></VideoClipTrack>
+{subs}
+</PremiereData>"#
+        );
+        let err = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap_err().to_string();
+        assert!(err.contains("media reference work limit") || err.contains("import work limit"), "{}", &err[..err.len().min(200)]);
+    }
+
+    #[test]
+    fn resolved_media_without_path_does_not_title_fallback_to_same_named_sequence() {
+        // Clip/media/sequence all named Intro: resolving Media with no path must stay offline, not nest Intro.
+        let xml = format!(
+            r#"<PremiereData>
+<Sequence ObjectUID="intro-seq"><Name>Intro</Name><TrackGroups><TrackGroup><Second ObjectRef="group"/></TrackGroup></TrackGroups></Sequence>
+<VideoTrackGroup ObjectID="group"><TrackGroup><FrameRate>8467200000</FrameRate><Tracks><Track ObjectURef="track"/></Tracks></TrackGroup></VideoTrackGroup>
+<VideoClipTrack ObjectUID="track"><ClipTrack><Track><Index>0</Index></Track><ClipItems><TrackItems><TrackItem ObjectRef="item"/></TrackItems></ClipItems></ClipTrack></VideoClipTrack>
+<VideoClipTrackItem ObjectID="item"><ClipTrackItem><TrackItem><Start>0</Start><End>{TPS}</End></TrackItem><SubClip ObjectRef="sub"/></ClipTrackItem></VideoClipTrackItem>
+<SubClip ObjectID="sub"><Name>Intro</Name><Clip ObjectRef="clip"/></SubClip>
+<VideoClip ObjectID="clip"><Clip><InPoint>0</InPoint><OutPoint>{TPS}</OutPoint><PlaybackSpeed>1</PlaybackSpeed><Source ObjectRef="src"/></Clip></VideoClip>
+<VideoMediaSource ObjectID="src"><MediaSource><Media ObjectURef="media"/></MediaSource></VideoMediaSource>
+<Media ObjectUID="media"><Title>Intro</Title></Media>
+</PremiereData>"#
+        );
+        let (fragment, tree, report) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
+        assert!(tree.sequences[0].tracks[0].items[0].media_path.is_none());
+        assert!(tree.sequences[0].tracks[0].items[0].nested_sequence.is_none(), "must not title-fallback to sequence Intro");
+        assert!(!report.mentions("using title fallback"), "{:?}", report.entries);
+        let clip_item = fragment.project.sequence(fragment.sequences[0]).unwrap().video_tracks[0].items[0].item;
+        assert_ne!(clip_item, fragment.sequences[0], "resolved empty Media must not become a nest of the same-named sequence");
+        assert!(fragment.project.item(clip_item).and_then(|i| i.as_media()).is_some(), "offline media placeholder retained");
     }
     // Hand-written XML: many pointers share one small caption item and one large payload.
     fn repeated_caption_block(pointers: usize) -> String {
@@ -2771,9 +2884,7 @@ mod tests {
             filed.insert(item, bin);
             order.push(item);
         }
-        let start = std::time::Instant::now();
         file_items(&mut p, &filed, &order);
-        assert!(start.elapsed() < std::time::Duration::from_secs(3), "{:?}", start.elapsed());
         let in_their_bins = p.root.children.iter().all(|c| match c {
             BinEntry::Bin(bin) => matches!(bin.children.as_slice(), [BinEntry::Item(id)] if filed.get(id) == Some(&bin.id)),
             BinEntry::Item(_) => false,

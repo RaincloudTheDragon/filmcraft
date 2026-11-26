@@ -1,5 +1,5 @@
 //! Native Premiere import with owned snapshots and read-only source handling. MIT OR Apache-2.0.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -101,6 +101,16 @@ fn probe_with_fallbacks(
     Err(errors)
 }
 
+/// Whether no file is at `original` nor at its project-relative path, both allowed by the
+/// document policy. Such an item is missing (Link Media and auto-relink look for it); one whose
+/// file exists but cannot be used, or whose path the policy refuses, stays offline.
+fn absent(original: &str, relative: Option<&String>, document: &Path) -> bool {
+    std::iter::once(original).chain(relative.map(String::as_str)).all(|candidate| {
+        crate::doc_path::resolve(candidate, Some(document))
+            .is_ok_and(|p| std::fs::symlink_metadata(&p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
+    })
+}
+
 /// The one entry of `path`'s folder whose name equals its file name apart from letter case, when
 /// `path` itself does not exist. None when there is no such entry, more than one, or the folder
 /// could not be listed in full.
@@ -116,8 +126,9 @@ fn case_variant(path: &Path, listings: &mut FolderListings) -> Option<PathBuf> {
 /// Most entries read from one folder when looking for a letter-case variant; a folder with more
 /// offers none.
 const MAX_FOLDER_ENTRIES: usize = 100_000;
-/// Most names the folder listings of one import keep (tens of megabytes at most); past it, a
-/// further folder is read again for each lookup, as without a cache.
+/// Most names the folder listings of one import keep (tens of megabytes at most). Past it, the
+/// least-recently used folder is dropped so a new folder can be kept; same-folder lookups never
+/// re-scan once that folder is cached.
 const MAX_LISTED_NAMES: usize = 250_000;
 
 /// A folder's entries by lower-case name: the entry's own name, or None when several entries
@@ -125,41 +136,76 @@ const MAX_LISTED_NAMES: usize = 250_000;
 type CaseIndex = std::collections::HashMap<String, Option<std::ffi::OsString>>;
 
 /// Folder listings one import reads while looking for letter-case variants: each folder is read
-/// once, however many of its files are missing, up to a bounded number of names in all.
+/// once while cached, however many of its files are missing, with an LRU bound on names in all.
 struct FolderListings {
     /// Folder → its entries, or None when it could not be read in full.
     folders: std::collections::HashMap<PathBuf, Option<CaseIndex>>,
+    /// LRU order, oldest first.
+    order: VecDeque<PathBuf>,
     /// Names kept so far (a folder that could not be read in full counts as one).
     names: usize,
     /// Most entries read from one folder ([`MAX_FOLDER_ENTRIES`]).
     entries: usize,
-    /// Most names kept.
+    /// Most names kept (one listing alone may exceed this so it is not re-read every lookup).
     limit: usize,
 }
 
 impl FolderListings {
     /// No listings yet; each folder is read up to `entries` entries, and at most `limit` names
-    /// will be kept.
+    /// will be kept across folders (LRU eviction).
     fn new(entries: usize, limit: usize) -> Self {
-        Self { folders: std::collections::HashMap::new(), names: 0, entries, limit }
+        Self { folders: std::collections::HashMap::new(), order: VecDeque::new(), names: 0, entries, limit }
     }
 
     /// The one entry of `folder` whose name is `lower` (lower case) apart from letter case; None
     /// when there is no such entry, more than one, or the folder cannot be read in full (kept or
     /// read again, the listing follows the same rule).
     fn find(&mut self, folder: &Path, lower: &str) -> Option<std::ffi::OsString> {
-        if let Some(listing) = self.folders.get(folder) {
-            return listing.as_ref()?.get(lower).cloned().flatten();
+        if self.folders.contains_key(folder) {
+            self.touch(folder);
+            return self.folders.get(folder).and_then(|listing| listing.as_ref()?.get(lower).cloned().flatten());
         }
         let listing =
             std::fs::read_dir(folder).ok().and_then(|entries| index_by_lower_case(entries.map(|entry| entry.map(|entry| entry.file_name())), self.entries));
         let found = listing.as_ref().and_then(|listing| listing.get(lower).cloned().flatten());
-        let cost = listing.as_ref().map_or(0, CaseIndex::len).max(1);
-        if let Some(names) = self.names.checked_add(cost).filter(|names| *names <= self.limit) {
-            self.names = names;
-            self.folders.insert(folder.to_path_buf(), listing);
-        }
+        self.remember(folder.to_path_buf(), listing);
         found
+    }
+
+    /// Mark `folder` as most recently used (it must already be cached).
+    fn touch(&mut self, folder: &Path) {
+        if let Some(i) = self.order.iter().position(|p| p == folder)
+            && let Some(path) = self.order.remove(i)
+        {
+            self.order.push_back(path);
+        }
+    }
+
+    /// Drop the least-recently used folder listing.
+    fn evict_oldest(&mut self) {
+        let Some(old) = self.order.pop_front() else { return };
+        if let Some(listing) = self.folders.remove(&old) {
+            let cost = listing.as_ref().map_or(0, CaseIndex::len).max(1);
+            self.names = self.names.saturating_sub(cost);
+        }
+    }
+
+    /// Cache `listing` for `folder`, evicting older folders until it fits. A single listing larger
+    /// than [`Self::limit`] replaces the whole cache so repeated lookups in that folder stay O(1).
+    fn remember(&mut self, folder: PathBuf, listing: Option<CaseIndex>) {
+        let cost = listing.as_ref().map_or(0, CaseIndex::len).max(1);
+        while !self.order.is_empty() && self.names.saturating_add(cost) > self.limit {
+            self.evict_oldest();
+        }
+        if self.names.saturating_add(cost) > self.limit {
+            // Sole folder still over budget: keep only it.
+            self.folders.clear();
+            self.order.clear();
+            self.names = 0;
+        }
+        self.names = self.names.saturating_add(cost);
+        self.order.push_back(folder.clone());
+        self.folders.insert(folder, listing);
     }
 }
 
@@ -179,6 +225,28 @@ fn index_by_lower_case(names: impl IntoIterator<Item = std::io::Result<std::ffi:
 /// SHA-256 (lower-case hex) and size of a whole regular file.
 pub(crate) fn hash_file(path: &Path) -> Result<(String, u64)> {
     hash_file_within(path, u64::MAX).map_err(|failure| failure.error)
+}
+
+/// Whether `path` still holds exactly `expected_len` bytes whose SHA-256 is `expected_hash`.
+/// Reads at most `expected_len + 1` bytes so a replaced, larger file cannot bypass the import input limit.
+fn source_unchanged(path: &Path, expected_len: u64, expected_hash: &str) -> Result<bool> {
+    let file = std::fs::File::open(path).map_err(io)?;
+    let mut hasher = Sha256::new();
+    let mut taken = file.take(expected_len.saturating_add(1));
+    let mut buf = [0u8; 65536];
+    let mut read = 0u64;
+    loop {
+        let n = taken.read(&mut buf).map_err(io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(buf.get(..n).ok_or_else(|| EngineError::Other(format!("{}: read past the buffer", path.display())))?);
+        read = read.saturating_add(n as u64);
+    }
+    if read != expected_len {
+        return Ok(false);
+    }
+    Ok(format!("{:x}", hasher.finalize()) == expected_hash)
 }
 
 /// Why a file could not be hashed, with how many of its bytes were read first: they count against
@@ -206,7 +274,10 @@ fn hash_counting(path: &Path, max: u64, read: &mut u64) -> Result<(String, u64)>
     let mut hash = Sha256::new();
     let mut buf = [0u8; 65536];
     loop {
-        let n = f.read(&mut buf).map_err(io)?;
+        // Cap each read to the remaining budget, plus one byte to distinguish EOF from growth past `max`.
+        let remaining = max.saturating_sub(*read).saturating_add(1);
+        let want = (buf.len() as u64).min(remaining) as usize;
+        let n = f.read(&mut buf[..want]).map_err(io)?;
         let chunk = buf.get(..n).ok_or_else(|| EngineError::Other(format!("{}: read past the buffer", path.display())))?;
         if chunk.is_empty() {
             break;
@@ -362,7 +433,6 @@ pub fn import(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// [`import`] with its whole-file reads replaceable in tests.
 pub(super) fn import_with_io(s: &mut Session, p: &Value, file_io: &FileIo) -> Result<Value> {
-    let hash = file_io.hash;
     if s.services.export_in_memory() {
         return Err(bad(COMMAND, "Premiere link/copy import requires a native filesystem host"));
     }
@@ -437,6 +507,8 @@ pub(super) fn import_with_io(s: &mut Session, p: &Value, file_io: &FileIo) -> Re
     write_new(&snapshot, &bytes)?;
     let mut records = BTreeMap::<String, SourceMedia>::new();
     let mut probed = BTreeMap::new();
+    // Stored paths with no file behind them: their items are missing, not offline.
+    let mut missing = std::collections::BTreeSet::<String>::new();
     // The sources probes opened (a linked file, or a finished copy), by the path their items keep:
     // the media pool takes them instead of opening those files again.
     let mut opened = BTreeMap::<String, filmcraft_media::SharedSource>::new();
@@ -458,6 +530,7 @@ pub(super) fn import_with_io(s: &mut Session, p: &Value, file_io: &FileIo) -> Re
                 Ok((src, media_source)) => {
                     record.original_path = stored_path(&src);
                     record.imported_path = record.original_path.clone();
+                    let probed_size = media_source.info().file_size;
                     let media_source = if mode == "copy" {
                         // The pool takes the copy's source, not this one.
                         drop(media_source);
@@ -468,33 +541,43 @@ pub(super) fn import_with_io(s: &mut Session, p: &Value, file_io: &FileIo) -> Re
                                 record.sha256 = Some(copied.digest);
                                 record.bytes = Some(copied.size);
                                 record.imported_path = copied.path;
-                                copied.source
+                                Some(copied.source)
                             }
                             Err(error) => {
-                                // The placeholder keeps the source's fingerprint when it can be read.
+                                // Keep fingerprint of the resolved source; leave probed empty so the item stays offline.
                                 record.identity = crate::relink::identity_of(&*s.services, &record.original_path).ok();
                                 filmcraft_interchange::premiere::warning(
                                     &mut report,
                                     format!("unreadable media: {}; {error}; offline placeholder retained", stored_path(&src)),
                                 );
-                                records.insert(original, record);
-                                m.offline = true;
-                                continue;
+                                None
                             }
                         }
                     } else {
-                        media_source
+                        Some(media_source)
                     };
-                    // Like its media information, the fingerprint is of the file the item names:
-                    // the source when linked, the finished copy when copied.
-                    record.identity = crate::relink::identity_of(&*s.services, &record.imported_path).ok();
-                    if mode != "copy" {
-                        // Linked media stays online after a successful probe without a full-file
-                        // read for provenance. A later hash is an observation, not import-time proof.
-                        record.bytes = record.identity.as_ref().map(|i| i.size);
+                    if let Some(media_source) = media_source {
+                        // Fingerprint the file the item names; for linked media, drop it when size disagrees with the probe.
+                        record.identity = crate::relink::identity_of(&*s.services, &record.imported_path).ok();
+                        if mode != "copy" {
+                            record.bytes = probed_size.or_else(|| record.identity.as_ref().map(|i| i.size));
+                            if let (Some(ps), Some(id)) = (probed_size, record.identity.as_ref())
+                                && ps != id.size
+                            {
+                                filmcraft_interchange::premiere::warning(
+                                    &mut report,
+                                    format!("{}: media changed during import fingerprint; Clip ID omitted", record.imported_path),
+                                );
+                                record.identity = None;
+                            }
+                        }
+                        probed.insert(original.clone(), media_source.info().clone());
+                        opened.insert(record.imported_path.clone(), media_source);
                     }
-                    probed.insert(original.clone(), media_source.info().clone());
-                    opened.insert(record.imported_path.clone(), media_source);
+                }
+                Err(error) if absent(&original, tree.relative_media.get(&original), &source) => {
+                    filmcraft_interchange::premiere::warning(&mut report, format!("{original}: {error}; missing, link it to reconnect"));
+                    missing.insert(original.clone());
                 }
                 Err(error) => filmcraft_interchange::premiere::warning(&mut report, format!("{original}: {error}; offline placeholder retained")),
             }
@@ -508,13 +591,15 @@ pub(super) fn import_with_io(s: &mut Session, p: &Value, file_io: &FileIo) -> Re
             m.info = info.clone();
             m.offline = false;
         } else {
-            m.offline = true;
+            m.offline = !missing.contains(&original);
         }
     }
-    // Offline placeholder dimensions are provisional; leave their source anchors automatic.
-    fragment.project.resolve_placed_auto_points(|_| true, |it| it.as_media().is_none_or(|m| !m.offline));
+    let placeholder = |m: &filmcraft_project::MediaClip| m.offline || matches!(&m.media, MediaRef::File { path } if missing.contains(path));
+    // Placeholder dimensions are provisional; leave their source anchors automatic.
+    fragment.project.resolve_placed_auto_points(|_| true, |it| it.as_media().is_none_or(|m| !placeholder(m)));
     // Refuse a changed project input rather than attaching the wrong source hash to its snapshot.
-    if hash(&source)?.0 != source_hash {
+    // Bound the re-read to the original length (+1 EOF byte) so a replaced huge file cannot bypass the import input limit.
+    if !source_unchanged(&source, bytes.len() as u64, &source_hash)? {
         return Err(bad(COMMAND, "project changed during import; try again"));
     }
     let warnings: Vec<String> = report.entries.iter().map(|e| e.message.clone()).collect();
@@ -547,13 +632,16 @@ pub(super) fn import_with_io(s: &mut Session, p: &Value, file_io: &FileIo) -> Re
     // any other item of that file opens its own, as the pool keeps one source per item.
     for item in s.project.items.values().filter(|i| !before.contains(&i.id)) {
         if let ItemKind::Media(m) = &item.kind
-            && !m.offline
+            && !placeholder(m)
             && let MediaRef::File { path } = &m.media
             && let Some(source) = opened.remove(path).or_else(|| s.media.open_file(path, &*s.services).ok())
         {
             s.media.insert_file(item.id, path, source);
         }
     }
+    // A missing file opens later (Link Media, a file that reappears) only as the project's document
+    // policy allows, like the stored paths of an opened project.
+    s.media.add_stored_paths(missing.iter().cloned(), Some(&stored_path(&source)));
     // Only this import's items: offline media already in the project is not part of its result.
     let offline: Vec<_> = s
         .project
@@ -561,7 +649,7 @@ pub(super) fn import_with_io(s: &mut Session, p: &Value, file_io: &FileIo) -> Re
         .values()
         .filter(|i| !before.contains(&i.id))
         .filter_map(|i| match &i.kind {
-            ItemKind::Media(m) if m.offline => Some(i.name.clone()),
+            ItemKind::Media(m) if placeholder(m) => Some(i.name.clone()),
             _ => None,
         })
         .collect();
@@ -769,20 +857,25 @@ pub fn open_document(s: &mut Session, path: &str) -> Result<Value> {
 /// Save the live project into a `.prproj`, patching mapped fields and retaining unmodeled XML.
 pub fn save_document(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     let t0 = web_time::Instant::now();
-    let Some(native) = s.premiere_native.as_mut() else {
+    let Some(native) = s.premiere_native.as_ref() else {
         return Err(EngineError::Other("no Premiere project is open for native save; open a .prproj first or use Save As to a .fcproj".into()));
     };
+    // Stage on a clone so a failed write or Save a Copy does not mutate the retained sidecar.
+    let mut staged = native.source.clone();
     let mut report = filmcraft_interchange::Report::default();
-    filmcraft_interchange::premiere::sync_from_project(&mut native.source, &native.bindings, &s.project, &mut report)
+    filmcraft_interchange::premiere::sync_from_project(&mut staged, &native.bindings, &s.project, &mut report)
         .map_err(|e| EngineError::Other(e.to_string()))?;
     let gzip = native.gzip;
-    let bytes = filmcraft_interchange::premiere::encode(&native.source, gzip).map_err(|e| EngineError::Other(e.to_string()))?;
+    let bytes = filmcraft_interchange::premiere::encode(&staged, gzip).map_err(|e| EngineError::Other(e.to_string()))?;
     s.services.write_file(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let warnings: Vec<String> = report.entries.iter().map(|e| e.message.clone()).collect();
     for w in &warnings {
         s.log.push(crate::panels::Level::Warning, "premiere.save", w.clone());
     }
     if adopt {
+        if let Some(live) = s.premiere_native.as_mut() {
+            live.source = staged;
+        }
         if let Some(name) = Path::new(path).file_stem().map(|n| n.to_string_lossy().into_owned())
             && s.project.name != name
         {
@@ -834,6 +927,12 @@ pub fn commands() -> Vec<CommandSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(tag: &str) -> tempfile::TempDir {
+        let root = filmcraft_testkit::workspace_root().join("target").join(tag);
+        let _ = std::fs::create_dir_all(&root);
+        tempfile::Builder::new().prefix("case-").tempdir_in(&root).unwrap_or_else(|_| tempfile::tempdir().unwrap())
+    }
     #[test]
     fn stored_paths_remove_windows_verbatim_prefixes_and_preserve_unc() {
         for (path, expected) in [
@@ -845,11 +944,26 @@ mod tests {
             assert_eq!(stored_path(Path::new(path)), expected);
         }
     }
+
+    #[test]
+    fn source_unchanged_stops_after_original_length_plus_one() {
+        let _scratch = scratch("premiere-source-rehash");
+        let dir = _scratch.path();
+        let path = dir.join("doc.prproj");
+        let original = b"<PremiereData/>";
+        std::fs::write(&path, original).unwrap();
+        let digest = format!("{:x}", Sha256::digest(original));
+        assert!(source_unchanged(&path, original.len() as u64, &digest).unwrap());
+        // A large replacement must be rejected after reading only one byte past the original length.
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&vec![b'X'; 8 * 1024 * 1024]).unwrap();
+        assert!(!source_unchanged(&path, original.len() as u64, &digest).unwrap());
+        std::fs::write(&path, &original[..original.len() - 1]).unwrap();
+        assert!(!source_unchanged(&path, original.len() as u64, &digest).unwrap(), "a shorter file is a change");
+    }
     #[test]
     fn copies_hold_exactly_the_hashed_bytes_and_never_replace_a_file() {
-        let dir = filmcraft_testkit::workspace_root().join("target/premiere-copy").join(std::process::id().to_string());
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = scratch("premiere-copy");
+        let dir = _scratch.path();
         let source = dir.join("source.bin");
         // Longer than one read buffer.
         std::fs::write(&source, (0..200_000u32).map(|i| i as u8).collect::<Vec<_>>()).unwrap();
@@ -872,13 +986,11 @@ mod tests {
         std::fs::write(&target, b"changed").unwrap();
         copy_hashing(&source, &partial).unwrap();
         assert!(publish_copy(&partial, &target, &copied.0, &hash_file).unwrap_err().to_string().contains("changed while copying"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn folder_listings_read_each_folder_once_and_keep_the_one_match_rule() {
-        let dir = filmcraft_testkit::workspace_root().join("target/premiere-listings").join(std::process::id().to_string());
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = scratch("premiere-listings");
+        let dir = _scratch.path();
         std::fs::write(dir.join("Clip.MOV"), b"").unwrap();
         std::fs::write(dir.join("other.mov"), b"").unwrap();
         let mut listings = FolderListings::new(MAX_FOLDER_ENTRIES, MAX_LISTED_NAMES);
@@ -888,17 +1000,28 @@ mod tests {
         std::fs::write(dir.join("Late.MOV"), b"").unwrap();
         assert_eq!(listings.find(&dir, "late.mov"), None);
         assert_eq!(listings.find(&dir.join("absent"), "clip.mov"), None, "a folder that cannot be read has no match");
-        // Past the limit a folder is read for every lookup, as without the cache.
-        let mut full = FolderListings::new(MAX_FOLDER_ENTRIES, 1);
-        assert_eq!(full.find(&dir, "late.mov"), Some("Late.MOV".into()));
+        // A listing larger than the names budget is still cached once (sticky) so repeats do not re-scan.
+        let mut tight = FolderListings::new(MAX_FOLDER_ENTRIES, 1);
+        assert_eq!(tight.find(&dir, "late.mov"), Some("Late.MOV".into()));
         std::fs::write(dir.join("Later.MOV"), b"").unwrap();
-        assert_eq!(full.find(&dir, "later.mov"), Some("Later.MOV".into()));
+        assert_eq!(tight.find(&dir, "later.mov"), None, "over-budget folder stays cached; no per-lookup re-read");
+        // LRU: a new folder evicts the older one; the evicted folder is listed again on next use.
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("One.MOV"), b"").unwrap();
+        std::fs::write(b.join("Two.MOV"), b"").unwrap();
+        let mut lru = FolderListings::new(MAX_FOLDER_ENTRIES, 1);
+        assert_eq!(lru.find(&a, "one.mov"), Some("One.MOV".into()));
+        assert_eq!(lru.find(&b, "two.mov"), Some("Two.MOV".into()), "new folder evicts the older listing");
+        std::fs::write(a.join("Fresh.MOV"), b"").unwrap();
+        assert_eq!(lru.find(&a, "fresh.mov"), Some("Fresh.MOV".into()), "evicted folder is re-listed");
         // Two entries whose names differ only in letter case are ambiguous: no match. Built from
         // names, as a case-insensitive disk cannot hold both files.
         let index = index_by_lower_case(names(&["Take.mov", "take.MOV", "b.png"]), MAX_FOLDER_ENTRIES).unwrap();
         assert_eq!(index.get("take.mov"), Some(&None));
         assert_eq!(index.get("b.png"), Some(&Some("b.png".into())));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
     /// Folder entries read without error, as `index_by_lower_case` takes them.
     fn names(names: &[&str]) -> Vec<std::io::Result<std::ffi::OsString>> {
@@ -915,10 +1038,9 @@ mod tests {
         failed.push(Err(std::io::Error::other("entry could not be read")));
         assert_eq!(index_by_lower_case(failed, MAX_FOLDER_ENTRIES), None, "an entry that could not be read");
         // A real folder past the entry limit offers neither of its names (whichever is read
-        // first), from a kept listing and from one read again for each lookup past the names limit.
-        let dir = filmcraft_testkit::workspace_root().join("target/premiere-partial-listing").join(std::process::id().to_string());
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // first), whether the incomplete listing is kept under the names budget or as a sticky sole entry.
+        let _scratch = scratch("premiere-partial-listing");
+        let dir = _scratch.path();
         std::fs::write(dir.join("Clip.MOV"), b"").unwrap();
         std::fs::write(dir.join("other.mov"), b"").unwrap();
         for limit in [MAX_LISTED_NAMES, 0] {
@@ -926,12 +1048,11 @@ mod tests {
             assert_eq!((listings.find(&dir, "clip.mov"), listings.find(&dir, "other.mov")), (None, None), "names limit {limit}");
         }
         assert_eq!(FolderListings::new(2, MAX_LISTED_NAMES).find(&dir, "clip.mov"), Some("Clip.MOV".into()), "listed in full");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn snapshot_bytes_survive_link_copy_undo_and_save() {
-        let dir = filmcraft_testkit::workspace_root().join("target/premiere-snapshot").join(std::process::id().to_string());
-        std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = scratch("premiere-snapshot");
+        let dir = _scratch.path();
         let source = dir.join("source.prproj");
         let xml = b"<PremiereData><Sequence ObjectUID=\"s\"><Name>Sequence</Name></Sequence></PremiereData>";
         std::fs::write(&source, xml).unwrap();
@@ -955,12 +1076,11 @@ mod tests {
             assert_eq!(session.project.workflow, provenance);
             assert_eq!(hash_file(&snapshot).unwrap(), expected);
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn offline_anchor_stays_auto_until_source_size_is_known() {
-        let dir = filmcraft_testkit::workspace_root().join("target/premiere-anchor").join(std::process::id().to_string());
-        std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = scratch("premiere-anchor");
+        let dir = _scratch.path();
         let source = dir.join("source.prproj");
         // Deliberately missing source, sequence size is not the source size.
         let xml = r#"<PremiereData><Sequence ObjectUID="s"><Name>S</Name><TrackGroups><TrackGroup><Second ObjectRef="v"/></TrackGroup></TrackGroups></Sequence><VideoTrackGroup ObjectID="v"><TrackGroup><Tracks><Track ObjectURef="t"/></Tracks></TrackGroup></VideoTrackGroup><VideoClipTrack ObjectUID="t"><ClipTrack><Track><Index>0</Index></Track><ClipItems><TrackItems><TrackItem ObjectRef="i"/></TrackItems></ClipItems></ClipTrack></VideoClipTrack><VideoClipTrackItem ObjectID="i"><ClipTrackItem><TrackItem><Start>0</Start><End>254016000000</End></TrackItem><SubClip ObjectRef="sub"/></ClipTrackItem></VideoClipTrackItem><SubClip ObjectID="sub"><Name>missing.mov</Name></SubClip></PremiereData>"#;
@@ -986,6 +1106,5 @@ mod tests {
         let seq = project.sequence(session.state.active_sequence.unwrap()).unwrap();
         let anchor = seq.video_tracks[0].items[0].effects.iter().find_map(|e| e.params.get("anchor")).unwrap();
         assert!(matches!(&anchor.value, filmcraft_project::ParamValue::Vec2(v) if v.x == 1920.0 && v.y == 1080.0));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

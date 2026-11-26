@@ -1616,6 +1616,8 @@ fn build() -> Vec<CommandSpec> {
         cmd!("file.newProject", "Project…", ["File", "New"], Some("Cmd+Alt+N"), r#"{"name":str}"#, always, |s, p| {
             let name = str_p(p, "name").unwrap_or("Untitled").to_string();
             crate::masks::discard_jobs(s);
+            // Drop any open `.prproj` sidecar so Save As cannot patch the previous Premiere XML.
+            s.premiere_native = None;
             s.project = std::sync::Arc::new(filmcraft_project::Project::new(&name));
             s.project_instance = std::sync::Arc::new(());
             s.document_epoch = s.document_epoch.wrapping_add(1);
@@ -1633,6 +1635,8 @@ fn build() -> Vec<CommandSpec> {
         }),
         cmd!("file.openDemoProject", "Demo Project", ["File", "New"], None, "{}", always, |s, _| {
             let (p, seq) = crate::demo::demo_project(&s.media);
+            // Drop any open `.prproj` sidecar so Save As cannot patch the previous Premiere XML.
+            s.premiere_native = None;
             s.project = std::sync::Arc::new(p);
             s.project_instance = std::sync::Arc::new(());
             s.document_epoch = s.document_epoch.wrapping_add(1);
@@ -5363,10 +5367,6 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     if is_premiere_project_path(path) {
         return crate::premiere::save_document(s, path, adopt);
     }
-    // Saving as FilmCraft leaves the Premiere XML behind: further Saves go to `.fcproj`.
-    if adopt {
-        s.premiere_native = None;
-    }
     let t0 = web_time::Instant::now();
     // Save As renames the project after its new file (not an edit: no undo step, not dirty).
     if adopt
@@ -5390,6 +5390,8 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     }
     s.services.write_file(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     if adopt {
+        // Clear only after the `.fcproj` write succeeds so a failed Save As still leaves native Save working.
+        s.premiere_native = None;
         s.path = Some(path.to_string());
         s.previews_follow_path();
         s.note_recent_project();
@@ -5445,8 +5447,10 @@ fn is_premiere_project_path(path: &str) -> bool {
 
 fn open_project(s: &mut Session, path: &str) -> Result<Value> {
     if is_premiere_project_path(path) {
+        // Cancel mask jobs only after open succeeds so a refused `.prproj` keeps tracking.
+        let opened = crate::premiere::open_document(s, path)?;
         crate::masks::discard_jobs(s);
-        return crate::premiere::open_document(s, path);
+        return Ok(opened);
     }
     let bytes = s.services.read_file_bounded(path, filmcraft_format::MAX_PROJECT_BYTES).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let loaded = filmcraft_format::decode(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
@@ -5480,6 +5484,16 @@ fn recover(s: &mut Session, id: Option<&str>) -> Result<Value> {
     let saved_at = per.local_time(c.meta.saved_unix);
     let loaded = crate::autosave::load_candidate(&c).map_err(EngineError::Other)?;
     install_project(s, loaded.project, c.meta.project_path.clone(), false);
+    // Re-attach the Premiere sidecar when the journal kept one; otherwise a `.prproj` path cannot Save natively.
+    let mut native_warning = None;
+    if let Some(native) = crate::autosave::load_native_sidecar(&c.dir) {
+        s.premiere_native = Some(native);
+    } else if c.meta.has_native || c.meta.project_path.as_deref().is_some_and(is_premiere_project_path) {
+        s.path = None;
+        native_warning = Some(
+            "Recovered Premiere project has no native sidecar; use Save As to a .fcproj, or reopen the .prproj".to_string(),
+        );
+    }
     if let Some(seq) = s.state.active_sequence {
         s.events.push(crate::Event::OpenSequence(seq));
     }
@@ -5501,8 +5515,19 @@ fn recover(s: &mut Session, id: Option<&str>) -> Result<Value> {
         ))
     })?;
     per.candidates.remove(idx);
+    if let Some(w) = &native_warning {
+        s.toast(w.clone());
+    }
     s.toast(format!("Recovered unsaved changes to {} from {saved_at}", c.meta.project_name));
-    Ok(json!({"id": c.id, "name": c.meta.project_name, "path": c.meta.project_path, "savedAt": saved_at, "revision": c.meta.revision}))
+    Ok(json!({
+        "id": c.id,
+        "name": c.meta.project_name,
+        "path": s.path,
+        "savedAt": saved_at,
+        "revision": c.meta.revision,
+        "native": s.premiere_native.is_some(),
+        "nativeWarning": native_warning,
+    }))
 }
 
 /// Where auto-saves of the current project go.

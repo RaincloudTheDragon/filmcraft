@@ -12,8 +12,17 @@ New code is MIT OR Apache-2.0.
 FilmCraft keeps the expanded Premiere XML beside the session; **File → Save** / `file.save`
 patches mapped fields (clip Start/End, InPoint/OutPoint, media paths, sequence name) and
 writes gzip or plain XML to match how the file was opened. Unmodeled Premiere elements are
-retained in the XML and listed in the command result’s `warnings`. `.fcproj` remains the
-native FilmCraft format; Save As to `.fcproj` clears the Premiere XML sidecar.
+retained in the XML and listed in the command result’s `warnings`. Sequences or clips added
+in FilmCraft (no Premiere ObjectUID/ObjectID binding) are not written into the `.prproj`; Save
+names each skipped sequence or clip in `warnings`. When several timeline items share one
+Premiere Clip object and their source ranges disagree, Save leaves that object’s InPoint/OutPoint
+unchanged and warns instead of last-wins overwrite. `.fcproj` remains the
+native FilmCraft format; Save As to `.fcproj` clears the Premiere XML sidecar. When
+**Auto Save also saves the current project** is on, the original-path write uses that same
+native Premiere writer (Auto-Save ring copies stay `.fcproj`). The crash-recovery journal also
+stores the Premiere XML and bindings beside `snapshot.fcproj`, so Recover can Save back into the
+`.prproj`. A journal without that sidecar clears the `.prproj` path and asks for Save As to
+`.fcproj` (or reopen the `.prproj`).
 
 `premiere.import` remains available to bring a Premiere project into an `.fcproj` with an
 immutable source snapshot and provenance.
@@ -38,7 +47,7 @@ are imported. Without it, the sequence with the most video items wins; “Sequen
 a tie-break, followed by the latest video end time.
 
 The result has the new `sequences`, the `destination`, `sourceSha256`, `mediaMode`,
-`offlineMedia` (the names of this import's media items left offline), `report` (the import's
+`offlineMedia` (the names of this import's media items left as placeholders, missing or offline), `report` (the import's
 diagnostic messages) and `reportEntries`: the same diagnostics, in the same order, as
 `{"level": "info" | "warning", "message", "count"}` like `events.list` entries.
 
@@ -112,8 +121,12 @@ intrinsic audio controls, scalar Lumetri controls, and named native transitions.
 records without absolute timing retain clip-edge fades. Unknown effects remain
 in the original snapshot and are reported once per distinct effect name with an occurrence count,
 rather than silently recreated with guessed parameters.
-Fonts/styles and transition appearance are not guaranteed to match Premiere. Missing, ambiguous
-or unreadable media remains visible as offline placeholders. A media path saved on the other
+Fonts/styles and transition appearance are not guaranteed to match Premiere. Media that cannot be
+used remains visible as a placeholder. When no file is at its stored path or its relative path,
+the item is missing, so Link Media, Relink others and `media.autoRelink` look for it; ambiguous,
+unreadable or refused media stays offline. A placeholder's frame size and duration are provisional
+(the sequence frame and the clip's extent), so relinking it may need Match File Properties'
+duration and metadata checks turned off. A media path saved on the other
 system family (POSIX against a Windows drive or share, or the reverse) is replaced by the stored
 `RelativePath` resolved against the project's folder; a stored path that cannot be opened falls
 back to that relative path with a warning. A `RelativePath` that names a drive (`..\..\C:\...`)
